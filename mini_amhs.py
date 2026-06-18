@@ -1,46 +1,62 @@
 """
-미니 AMHS 반송 시뮬레이터 — D-5 "돌아가는 깡통" (최소 실행 버전)
+미니 AMHS 반송 시뮬레이터 — D-4 (장비 대기시간 KPI + 배차 규칙 비교)
 ------------------------------------------------------------------
-핵심 질문: 레일/스토커 배치를 바꾸면 반송 성능이 어떻게 달라지는가?
-이 파일은 그 실험을 위한 '게임 엔진'의 가장 단순한 형태다.
+D-5 깡통에서 추가된 것:
+  1) 장비를 '살아있는 존재'로: FOUP 받으면 PROCESS_TIME 동안 공정 →
+     끝나면 다음 장비로 보낼 콜을 스스로 생성 → 다음 게 없으면 '굶은 시간' 카운트
+  2) 핵심 KPI = '장비 총 대기시간(굶은 시간)' = 곧 가동률·양산
+  3) 배차 규칙 2종 비교: 가장 가까운 차 vs 가장 한가한 차
 
-구성 흐름(보드게임처럼 매 tick마다):
-  1) 새 운반요청(콜) 생성  2) 빈 차에 배차  3) 차 한 칸 이동
-  4) 도착 처리            5) 기록
+설계 메모(백로그):
+  - 공정시간은 지금 모든 장비 고정(PROCESS_TIME). 나중에 장비별 차등.
+  - dispatcher는 '동일 인터페이스'로 비워둠 → 나중에 강화학습 두뇌를 그 자리에 꽂기만.
 """
 
 import random
 import networkx as nx
 
-random.seed(42)  # 재현 가능하게 (실험엔 필수)
+PROCESS_TIME = 8        # 장비가 FOUP 하나 공정하는 데 걸리는 시간(고정) — 나중에 차등
+INITIAL_FOUPS = 6       # 팹 안을 순환하는 FOUP 총개수
 
 
 # ──────────────────────────────────────────────────────────
-# 1. 가상 팹 = 지하철 노선도(그래프)
-#    노드 = 역(장비/스토커/교차점), 엣지 = 레일(가중치=이동시간)
+# 1. 가상 팹 = 그래프 (나중에 layouts.py에서 이 부분을 바꿔가며 비교)
 # ──────────────────────────────────────────────────────────
 def build_fab(rows=4, cols=4):
-    """격자형 팹을 만든다. 나중에 layouts.py에서 이 부분을 바꿔가며 비교."""
-    G = nx.grid_2d_graph(rows, cols)          # (r,c) 좌표가 노드가 됨
+    G = nx.grid_2d_graph(rows, cols)
     for u, v in G.edges():
-        G[u][v]["time"] = 1                   # 한 구간 이동 = 1 tick (단순화)
-
-    # 역할 지정: 한 노드는 스토커(보관창고), 몇 노드는 장비(Tool)
+        G[u][v]["time"] = 1
     stocker = (0, 0)
-    tools = [(0, cols - 1), (rows - 1, 0), (rows - 1, cols - 1), (rows // 2, cols // 2)]
-    return G, stocker, tools
+    tool_nodes = [(0, cols - 1), (rows - 1, 0), (rows - 1, cols - 1), (rows // 2, cols // 2)]
+    return G, stocker, tool_nodes
 
 
 # ──────────────────────────────────────────────────────────
-# 2. OHT 차량 — 현재 상태판
+# 2. 장비(Tool) — 이제 '살아있는 존재' (공정하고, 굶주린다)
+# ──────────────────────────────────────────────────────────
+class Tool:
+    def __init__(self, node):
+        self.node = node
+        self.queue = 0            # 입력 대기 중인 FOUP 수
+        self.proc_remaining = 0   # 공정 남은 시간 (0이면 안 하는 중)
+        self.starve_ticks = 0     # 굶은 시간 누적 ← 핵심 KPI
+        self.busy_ticks = 0       # 공정한 시간 누적 (가동률용)
+
+    @property
+    def processing(self):
+        return self.proc_remaining > 0
+
+
+# ──────────────────────────────────────────────────────────
+# 3. OHT 차량
 # ──────────────────────────────────────────────────────────
 class Vehicle:
     def __init__(self, vid, pos):
         self.id = vid
-        self.pos = pos          # 현재 위치(노드)
-        self.path = []          # 남은 경로(노드 리스트)
-        self.job = None         # 맡은 작업 (None이면 놀고 있음)
-        self.busy_ticks = 0     # 가동률 계산용
+        self.pos = pos
+        self.path = []
+        self.job = None
+        self.busy_ticks = 0
 
     @property
     def idle(self):
@@ -48,98 +64,106 @@ class Vehicle:
 
 
 # ──────────────────────────────────────────────────────────
-# 3. 운반요청(Job) — "언제, 어디서, 어디로"
-#    D-5는 단순 랜덤. (나중에 실제 공정순서로 고도화 가능)
+# 4. 운반요청(Job) — 이제 장비가 공정 끝낼 때 '스스로' 생성
 # ──────────────────────────────────────────────────────────
 class Job:
-    def __init__(self, jid, src, dst, created):
-        self.id = jid
+    def __init__(self, src, dst, created):
         self.src = src
         self.dst = dst
-        self.created = created      # 생성 시각
-        self.done = None            # 완료 시각
+        self.created = created
+        self.done = None
 
 
 # ──────────────────────────────────────────────────────────
-# 4. 배차 두뇌 — "어느 빈 차를 보낼까"
-#    여기만 갈아끼우며 비교한다 (dispatcher.py의 핵심)
+# 5. 배차 두뇌 — 동일 인터페이스(G, job, idle) -> vehicle
+#    이 자리에 나중에 강화학습 두뇌를 그대로 꽂을 수 있다.
 # ──────────────────────────────────────────────────────────
 def dispatch_nearest(G, job, idle_vehicles):
-    """가장 가까운 빈 차를 고른다(최단경로 거리 기준)."""
-    best, best_dist = None, float("inf")
-    for v in idle_vehicles:
-        d = nx.shortest_path_length(G, v.pos, job.src, weight="time")
-        if d < best_dist:
-            best, best_dist = v, d
-    return best
+    """가장 가까운 빈 차."""
+    return min(idle_vehicles,
+               key=lambda v: nx.shortest_path_length(G, v.pos, job.src, weight="time"))
+
+
+def dispatch_least_busy(G, job, idle_vehicles):
+    """가장 한가한(덜 일한) 차 — 일을 고르게 나눠 특정 차 과부하 방지."""
+    return min(idle_vehicles, key=lambda v: v.busy_ticks)
 
 
 # ──────────────────────────────────────────────────────────
-# 5. 메인 루프 — 보드게임 진행자(sim.py)
+# 6. 메인 루프
 # ──────────────────────────────────────────────────────────
-def run(total_ticks=300, n_vehicles=3, job_rate=0.5, dispatcher=dispatch_nearest):
-    G, stocker, tools = build_fab()
+def run(total_ticks=300, n_vehicles=3, dispatcher=dispatch_nearest, seed=42):
+    random.seed(seed)
+    G, stocker, tool_nodes = build_fab()
+    tools = {n: Tool(n) for n in tool_nodes}
     vehicles = [Vehicle(i, stocker) for i in range(n_vehicles)]
-    pending = []            # 아직 배차 안 된 콜
-    completed = []          # 완료된 콜
-    job_counter = 0
+    pending, completed = [], []
+
+    # 초기 FOUP을 장비 큐에 흩뿌려 둔다 (순환 시작점)
+    for _ in range(INITIAL_FOUPS):
+        tools[random.choice(tool_nodes)].queue += 1
 
     for t in range(total_ticks):
-        # (1) 새 콜 생성 — 확률적으로
-        if random.random() < job_rate:
-            src = random.choice([stocker] + tools)
-            dst = random.choice([x for x in tools if x != src])
-            pending.append(Job(job_counter, src, dst, t))
-            job_counter += 1
+        # (A) 장비 갱신: 공정 진행 / 완료 시 다음 장비로 콜 생성 / 굶주림 카운트
+        for tool in tools.values():
+            if tool.processing:
+                tool.proc_remaining -= 1
+                tool.busy_ticks += 1
+                if tool.proc_remaining == 0:        # 공정 완료 → 다음 장비로 보낼 콜 생성
+                    dst = random.choice([n for n in tool_nodes if n != tool.node])
+                    pending.append(Job(tool.node, dst, t))
+            if not tool.processing:                 # 안 하는 중이면
+                if tool.queue > 0:                  # 큐에 있으면 다음 공정 시작
+                    tool.queue -= 1
+                    tool.proc_remaining = PROCESS_TIME
+                else:                               # 없으면 → 굶는 중
+                    tool.starve_ticks += 1
 
-        # (2) 배차: 빈 차가 있고 대기 콜이 있으면 매칭
+        # (B) 배차
         idle = [v for v in vehicles if v.idle]
         for job in list(pending):
             if not idle:
                 break
             v = dispatcher(G, job, idle)
-            # 경로 = (현위치→픽업지) + (픽업지→목적지)
             to_src = nx.shortest_path(G, v.pos, job.src, weight="time")
             to_dst = nx.shortest_path(G, job.src, job.dst, weight="time")
-            v.path = to_src[1:] + to_dst[1:]   # 현위치 중복 제거
+            v.path = to_src[1:] + to_dst[1:]
             v.job = job
             pending.remove(job)
             idle.remove(v)
 
-        # (3)(4) 이동 & 도착 처리
+        # (C) 이동 & 배달
         for v in vehicles:
             if not v.idle:
                 v.busy_ticks += 1
                 if v.path:
-                    v.pos = v.path.pop(0)      # 한 칸 전진
-                if not v.path:                 # 목적지 도착
+                    v.pos = v.path.pop(0)
+                if not v.path:                      # 목적지 도착 = 배달 완료
                     v.job.done = t
+                    tools[v.job.dst].queue += 1      # 도착 장비 입력 큐 +1
                     completed.append(v.job)
                     v.job = None
 
-    # (5) KPI 집계
-    return summarize(completed, vehicles, total_ticks, len(pending))
+    return summarize(tools, vehicles, completed, total_ticks, len(pending))
 
 
-def summarize(completed, vehicles, total_ticks, leftover):
-    if completed:
-        lead_times = [j.done - j.created for j in completed]
-        avg_lead = sum(lead_times) / len(lead_times)
-        max_lead = max(lead_times)
-    else:
-        avg_lead = max_lead = 0
-    util = sum(v.busy_ticks for v in vehicles) / (len(vehicles) * total_ticks)
+def summarize(tools, vehicles, completed, total_ticks, leftover):
+    total_starve = sum(tl.starve_ticks for tl in tools.values())
+    tool_util = sum(tl.busy_ticks for tl in tools.values()) / (len(tools) * total_ticks)
+    veh_util = sum(v.busy_ticks for v in vehicles) / (len(vehicles) * total_ticks)
     return {
+        "장비_총_대기시간(굶은tick)": total_starve,   # ★ 핵심 KPI (낮을수록 좋음)
+        "장비_평균_가동률": round(tool_util, 3),
         "완료_운반수(처리량)": len(completed),
         "미처리_대기콜": leftover,
-        "평균_반송완료시간": round(avg_lead, 2),
-        "최대_반송완료시간": max_lead,
-        "차량_가동률": round(util, 3),
+        "차량_가동률": round(veh_util, 3),
     }
 
 
 if __name__ == "__main__":
-    result = run()
-    print("=== 미니 AMHS 시뮬레이션 결과 (D-5 깡통) ===")
-    for k, v in result.items():
-        print(f"  {k:18s}: {v}")
+    print("=== D-4: 배차 규칙 비교 ===")
+    for name, disp in [("가까운 차", dispatch_nearest), ("한가한 차", dispatch_least_busy)]:
+        r = run(dispatcher=disp)
+        print(f"\n[{name}]")
+        for k, v in r.items():
+            print(f"  {k:22s}: {v}")
